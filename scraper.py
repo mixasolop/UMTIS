@@ -1,13 +1,11 @@
 import argparse
 import csv
+import html
 import json
 import re
 import sqlite3
 import sys
 import urllib.request
-
-from text_processing import clean_text
-
 
 REMOTEOK_API_URL = "https://remoteok.com/api"
 GREENHOUSE_API_TEMPLATE = "https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true"
@@ -346,6 +344,13 @@ def guess_role(title, description_clean):
             best_score = score
 
     return best_role
+
+
+def clean_text(text):
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def deduplicate_jobs(jobs):
