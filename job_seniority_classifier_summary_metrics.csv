@@ -1,2 +1,0 @@
-train_rows,test_rows,accuracy,macro_f1,weighted_f1
-800,200,0.83,0.736343645486027,0.8308931204426172

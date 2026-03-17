@@ -1,0 +1,11 @@
+true_label,predicted_label,count
+Other,DevOps,6
+DevOps,Other,5
+Other,Backend,5
+DevOps,Backend,4
+DevOps,Data Analyst,4
+Other,Data Analyst,3
+Backend,DevOps,2
+Other,QA,2
+Data Analyst,DevOps,1
+Data Analyst,Other,1

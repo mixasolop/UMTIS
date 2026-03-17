@@ -1,6 +1,6 @@
 import argparse
 import sqlite3
-from pathlib import Path
+import warnings
 
 import joblib
 import pandas as pd
@@ -10,118 +10,95 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-import warnings
 
 from scraper import build_model_text
 
 
+TEST_SIZE = 0.2
+MIN_CLASS_SIZE = 2
+MAX_FEATURES = 5000
+CLASS_WEIGHT = "balanced"
 TOP_CONFUSION_LIMIT = 10
-TARGET_CONFIG = {
-    "role": {
-        "label_column": "role_label",
-        "guess_column": "role_guess",
-        "default_model_out": "job_classifier.pkl",
-    },
-    "seniority": {
+
+
+def get_target_info(target):
+    if target == "role":
+        return {
+            "label_column": "role_label",
+            "guess_column": "role_guess",
+            "model_path": "job_classifier.pkl",
+        }
+
+    return {
         "label_column": "seniority_label",
         "guess_column": "seniority_guess",
-        "default_model_out": "job_seniority_classifier.pkl",
-    },
-}
+        "model_path": "job_seniority_classifier.pkl",
+    }
 
 
-def load_labeled_jobs(
-    db_path,
-    min_class_size,
-    exclude_other,
-    label_column,
-    guess_column,
-    allow_guess_fallback,
-):
+def load_data(db_path, target, allow_guess_fallback):
+    target_info = get_target_info(target)
     connection = sqlite3.connect(db_path)
     try:
         dataframe = pd.read_sql_query(
-            """
+            f"""
             SELECT job_id, company, source, title, description_clean,
-                   {label_column} AS label,
-                   {guess_column} AS guess_label
+                   {target_info['label_column']} AS label,
+                   {target_info['guess_column']} AS guess_label
             FROM jobs
-            """.format(label_column=label_column, guess_column=guess_column),
+            """,
             connection,
         )
     finally:
         connection.close()
 
-    if dataframe.empty:
-        raise ValueError("No rows found in jobs table.")
-
     dataframe["label"] = dataframe["label"].fillna("").str.strip()
     dataframe["guess_label"] = dataframe["guess_label"].fillna("").str.strip()
 
-    labeled_mask = dataframe["label"] != ""
-    if not labeled_mask.any():
+    labeled = dataframe[dataframe["label"] != ""].copy()
+    if labeled.empty:
         if not allow_guess_fallback:
             raise ValueError(
-                f"No labeled rows found in jobs.{label_column}. "
-                f"Import labels first or use --allow-guess-fallback to bootstrap from jobs.{guess_column}."
+                f"No rows found in {target_info['label_column']}. "
+                f"Import labels first or run with --allow-guess-fallback."
             )
 
-        guessed_mask = dataframe["guess_label"] != ""
-        if not guessed_mask.any():
-            raise ValueError(
-                f"No labeled rows found in jobs.{label_column} and no fallback values are available in jobs.{guess_column}."
-            )
+        labeled = dataframe[dataframe["guess_label"] != ""].copy()
+        if labeled.empty:
+            raise ValueError(f"No rows found in {target_info['guess_column']} either.")
 
         print(
-            f"Warning: no manual labels found in {label_column}. "
-            f"Falling back to {guess_column} for training."
+            f"Warning: training {target} from {target_info['guess_column']} because "
+            f"{target_info['label_column']} is empty."
         )
-        dataframe = dataframe[guessed_mask].copy()
-        dataframe["label"] = dataframe["guess_label"]
-    else:
-        dataframe = dataframe[labeled_mask].copy()
+        labeled["label"] = labeled["guess_label"]
 
-    if dataframe.empty:
-        raise ValueError(
-            "No labeled rows available after filtering."
-        )
-
-    if exclude_other:
-        dataframe = dataframe[dataframe["label"] != "Other"].copy()
-
-    if dataframe.empty:
-        raise ValueError(
-            "No labeled rows left after filtering. Try training without --exclude-other."
-        )
-
-    dataframe["text"] = [
+    labeled["text"] = [
         build_model_text(title, description_clean)
         for title, description_clean in zip(
-            dataframe["title"].fillna(""),
-            dataframe["description_clean"].fillna(""),
+            labeled["title"].fillna(""),
+            labeled["description_clean"].fillna(""),
         )
     ]
 
-    class_counts = dataframe["label"].value_counts()
-    valid_labels = class_counts[class_counts >= min_class_size].index
-    filtered_dataframe = dataframe[dataframe["label"].isin(valid_labels)].copy()
+    class_counts = labeled["label"].value_counts()
+    valid_labels = class_counts[class_counts >= MIN_CLASS_SIZE].index
+    filtered = labeled[labeled["label"].isin(valid_labels)].copy()
 
-    dropped_labels = class_counts[class_counts < min_class_size]
-    if not dropped_labels.empty:
+    dropped = class_counts[class_counts < MIN_CLASS_SIZE]
+    if not dropped.empty:
         print("Dropped rare classes:")
-        for label_name, count in dropped_labels.items():
+        for label_name, count in dropped.items():
             print(f"  {label_name}: {count}")
         print()
 
-    if filtered_dataframe["label"].nunique() < 2:
-        raise ValueError(
-            "Need at least 2 classes with enough labeled rows to train a classifier."
-        )
+    if filtered["label"].nunique() < 2:
+        raise ValueError("Need at least 2 classes to train.")
 
-    return filtered_dataframe
+    return filtered, target_info["model_path"]
 
 
-def build_model(max_features, class_weight):
+def build_model():
     return Pipeline(
         [
             (
@@ -130,76 +107,110 @@ def build_model(max_features, class_weight):
                     lowercase=True,
                     stop_words="english",
                     ngram_range=(1, 2),
-                    max_features=max_features,
+                    max_features=MAX_FEATURES,
                 ),
             ),
             (
                 "clf",
                 LogisticRegression(
                     max_iter=2000,
-                    class_weight=class_weight,
+                    class_weight=CLASS_WEIGHT,
                 ),
             ),
         ]
     )
 
 
-def get_prediction_scores(model, features):
-    if hasattr(model, "predict_proba"):
-        probabilities = model.predict_proba(features)
-        return probabilities.max(axis=1)
-    return None
+def save_results(model_path, train_frame, test_frame, train_pred, test_pred, train_scores, test_scores, summary, per_class, confusion, top_confusions):
+    stem = model_path.replace(".pkl", "")
 
-
-def build_prediction_frame(split_name, dataframe, predicted_labels, predicted_scores):
-    prediction_frame = dataframe[
+    train_predictions = train_frame[
         ["job_id", "company", "source", "title", "description_clean", "label"]
     ].copy()
-    prediction_frame.insert(0, "split", split_name)
-    prediction_frame = prediction_frame.rename(columns={"label": "true_label"})
-    prediction_frame["predicted_label"] = predicted_labels
-    prediction_frame["is_correct"] = (
-        prediction_frame["true_label"] == prediction_frame["predicted_label"]
+    train_predictions["split"] = "train"
+    train_predictions = train_predictions.rename(columns={"label": "true_label"})
+    train_predictions["predicted_label"] = train_pred
+    train_predictions["is_correct"] = (
+        train_predictions["true_label"] == train_predictions["predicted_label"]
+    )
+    train_predictions["predicted_score"] = train_scores.round(6)
+
+    test_predictions = test_frame[
+        ["job_id", "company", "source", "title", "description_clean", "label"]
+    ].copy()
+    test_predictions["split"] = "test"
+    test_predictions = test_predictions.rename(columns={"label": "true_label"})
+    test_predictions["predicted_label"] = test_pred
+    test_predictions["is_correct"] = (
+        test_predictions["true_label"] == test_predictions["predicted_label"]
+    )
+    test_predictions["predicted_score"] = test_scores.round(6)
+
+    test_errors = test_predictions[~test_predictions["is_correct"]].copy()
+    test_errors = test_errors.sort_values(
+        by=["predicted_score", "true_label", "predicted_label"],
+        ascending=[False, True, True],
     )
 
-    if predicted_scores is not None:
-        prediction_frame["predicted_score"] = predicted_scores.round(6)
+    train_predictions.to_csv(f"{stem}_train_predictions.csv", index=False)
+    test_predictions.to_csv(f"{stem}_test_predictions.csv", index=False)
+    test_errors.to_csv(f"{stem}_test_errors.csv", index=False)
+    per_class.to_csv(f"{stem}_per_class_metrics.csv")
+    confusion.to_csv(f"{stem}_confusion_matrix.csv")
+    top_confusions.to_csv(f"{stem}_top_confusion_pairs.csv", index=False)
+    pd.DataFrame([summary]).to_csv(f"{stem}_summary_metrics.csv", index=False)
 
-    return prediction_frame
 
+def train_and_save(dataframe, model_path):
+    train_frame, test_frame = train_test_split(
+        dataframe,
+        test_size=TEST_SIZE,
+        random_state=42,
+        stratify=dataframe["label"],
+    )
 
-def build_per_class_metrics(report_dict, label_order):
-    per_class_metrics = (
-        pd.DataFrame(report_dict)
+    model = build_model()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        model.fit(train_frame["text"], train_frame["label"])
+
+    train_pred = model.predict(train_frame["text"])
+    test_pred = model.predict(test_frame["text"])
+    train_scores = model.predict_proba(train_frame["text"]).max(axis=1)
+    test_scores = model.predict_proba(test_frame["text"]).max(axis=1)
+
+    labels = list(model.classes_)
+    report = classification_report(
+        test_frame["label"],
+        test_pred,
+        labels=labels,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    per_class = (
+        pd.DataFrame(report)
         .transpose()
-        .loc[label_order, ["precision", "recall", "f1-score", "support"]]
+        .loc[labels, ["precision", "recall", "f1-score", "support"]]
         .rename(columns={"f1-score": "f1_score"})
     )
-    per_class_metrics["support"] = per_class_metrics["support"].astype(int)
-    per_class_metrics.index.name = "label"
-    return per_class_metrics
+    per_class["support"] = per_class["support"].astype(int)
+    per_class.index.name = "label"
 
-
-def build_confusion_frame(y_true, predictions, label_order):
     confusion = pd.DataFrame(
-        confusion_matrix(y_true, predictions, labels=label_order),
-        index=label_order,
-        columns=label_order,
+        confusion_matrix(test_frame["label"], test_pred, labels=labels),
+        index=labels,
+        columns=labels,
     )
     confusion.index.name = "true_label"
     confusion.columns.name = "predicted_label"
-    return confusion
 
-
-def find_top_confusion_pairs(confusion_frame, limit=TOP_CONFUSION_LIMIT):
     pairs = []
-
-    for true_label in confusion_frame.index:
-        for predicted_label in confusion_frame.columns:
+    for true_label in labels:
+        for predicted_label in labels:
             if true_label == predicted_label:
                 continue
-
-            count = int(confusion_frame.loc[true_label, predicted_label])
+            count = int(confusion.loc[true_label, predicted_label])
             if count > 0:
                 pairs.append(
                     {
@@ -208,235 +219,90 @@ def find_top_confusion_pairs(confusion_frame, limit=TOP_CONFUSION_LIMIT):
                         "count": count,
                     }
                 )
+    top_confusions = pd.DataFrame(pairs)
+    if not top_confusions.empty:
+        top_confusions = top_confusions.sort_values(
+            by=["count", "true_label", "predicted_label"],
+            ascending=[False, True, True],
+        ).head(TOP_CONFUSION_LIMIT)
 
-    if not pairs:
-        return pd.DataFrame(columns=["true_label", "predicted_label", "count"])
+    summary = {
+        "train_rows": len(train_frame),
+        "test_rows": len(test_frame),
+        "accuracy": accuracy_score(test_frame["label"], test_pred),
+        "macro_f1": f1_score(test_frame["label"], test_pred, average="macro"),
+        "weighted_f1": f1_score(test_frame["label"], test_pred, average="weighted"),
+    }
 
-    return pd.DataFrame(pairs).sort_values(
-        by=["count", "true_label", "predicted_label"],
-        ascending=[False, True, True],
-    ).head(limit)
-
-
-def format_float_columns(dataframe, columns):
-    printable = dataframe.copy()
-    for column_name in columns:
-        if column_name in printable.columns:
-            printable[column_name] = printable[column_name].map(
-                lambda value: f"{value:.4f}"
-            )
-    return printable
-
-
-def print_section(title):
-    print(title)
-    print("-" * len(title))
-
-
-def print_summary(summary_metrics):
-    print_section("Evaluation Summary")
-    print(f"Train rows   : {summary_metrics['train_rows']}")
-    print(f"Test rows    : {summary_metrics['test_rows']}")
-    print(f"Accuracy     : {summary_metrics['accuracy']:.4f}")
-    print(f"Macro F1     : {summary_metrics['macro_f1']:.4f}")
-    print(f"Weighted F1  : {summary_metrics['weighted_f1']:.4f}")
+    print("Evaluation Summary")
+    print("------------------")
+    print(f"Train rows   : {summary['train_rows']}")
+    print(f"Test rows    : {summary['test_rows']}")
+    print(f"Accuracy     : {summary['accuracy']:.4f}")
+    print(f"Macro F1     : {summary['macro_f1']:.4f}")
+    print(f"Weighted F1  : {summary['weighted_f1']:.4f}")
     print()
 
-
-def print_per_class_metrics(per_class_metrics):
-    print_section("Per-Class Metrics")
-    printable = format_float_columns(
-        per_class_metrics.reset_index(),
-        ["precision", "recall", "f1_score"],
-    )
+    print("Per-Class Metrics")
+    print("-----------------")
+    printable = per_class.reset_index().copy()
+    for column_name in ["precision", "recall", "f1_score"]:
+        printable[column_name] = printable[column_name].map(lambda value: f"{value:.4f}")
     print(printable.to_string(index=False))
     print()
 
-
-def print_confusion_matrix(confusion_frame):
-    print_section("Confusion Matrix")
+    print("Confusion Matrix")
+    print("----------------")
     print("Rows = true labels, columns = predicted labels")
-    print(confusion_frame.to_string())
+    print(confusion.to_string())
     print()
 
-
-def print_top_confusions(top_confusions):
-    print_section("Top Confusion Pairs")
+    print("Top Confusion Pairs")
+    print("-------------------")
     if top_confusions.empty:
         print("No off-diagonal confusions found in the test split.")
     else:
         print(top_confusions.to_string(index=False))
     print()
 
-
-def resolve_artifact_paths(model_out, artifacts_dir):
-    model_path = Path(model_out)
-    output_dir = Path(artifacts_dir) if artifacts_dir else model_path.parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = model_path.stem
-
-    return {
-        "train_predictions": output_dir / f"{stem}_train_predictions.csv",
-        "test_predictions": output_dir / f"{stem}_test_predictions.csv",
-        "per_class_metrics": output_dir / f"{stem}_per_class_metrics.csv",
-        "confusion_matrix": output_dir / f"{stem}_confusion_matrix.csv",
-        "top_confusions": output_dir / f"{stem}_top_confusion_pairs.csv",
-        "test_errors": output_dir / f"{stem}_test_errors.csv",
-        "summary_metrics": output_dir / f"{stem}_summary_metrics.csv",
-    }
-
-
-def save_artifacts(evaluation_result, artifact_paths):
-    evaluation_result["train_predictions"].to_csv(
-        artifact_paths["train_predictions"], index=False
+    joblib.dump(model, model_path)
+    save_results(
+        model_path,
+        train_frame,
+        test_frame,
+        train_pred,
+        test_pred,
+        train_scores,
+        test_scores,
+        summary,
+        per_class,
+        confusion,
+        top_confusions,
     )
-    evaluation_result["test_predictions"].to_csv(
-        artifact_paths["test_predictions"], index=False
-    )
-    evaluation_result["per_class_metrics"].to_csv(artifact_paths["per_class_metrics"])
-    evaluation_result["confusion_matrix"].to_csv(artifact_paths["confusion_matrix"])
-    evaluation_result["top_confusions"].to_csv(
-        artifact_paths["top_confusions"], index=False
-    )
-    evaluation_result["test_errors"].to_csv(artifact_paths["test_errors"], index=False)
-    pd.DataFrame([evaluation_result["summary_metrics"]]).to_csv(
-        artifact_paths["summary_metrics"], index=False
-    )
-
-
-def train_and_evaluate(dataframe, test_size, max_features, class_weight):
-    train_frame, test_frame = train_test_split(
-        dataframe,
-        test_size=test_size,
-        random_state=42,
-        stratify=dataframe["label"],
-    )
-
-    x_train = train_frame["text"]
-    y_train = train_frame["label"]
-    x_test = test_frame["text"]
-    y_test = test_frame["label"]
-
-    model = build_model(max_features=max_features, class_weight=class_weight)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        model.fit(x_train, y_train)
-
-    train_predictions = model.predict(x_train)
-    test_predictions = model.predict(x_test)
-    label_order = list(model.classes_)
-
-    report_dict = classification_report(
-        y_test,
-        test_predictions,
-        labels=label_order,
-        output_dict=True,
-        zero_division=0,
-    )
-    per_class_metrics = build_per_class_metrics(report_dict, label_order)
-    confusion_frame = build_confusion_frame(y_test, test_predictions, label_order)
-    top_confusions = find_top_confusion_pairs(confusion_frame)
-
-    train_scores = get_prediction_scores(model, x_train)
-    test_scores = get_prediction_scores(model, x_test)
-
-    summary_metrics = {
-        "train_rows": len(train_frame),
-        "test_rows": len(test_frame),
-        "accuracy": accuracy_score(y_test, test_predictions),
-        "macro_f1": f1_score(y_test, test_predictions, average="macro"),
-        "weighted_f1": f1_score(y_test, test_predictions, average="weighted"),
-    }
-
-    return {
-        "model": model,
-        "summary_metrics": summary_metrics,
-        "per_class_metrics": per_class_metrics,
-        "confusion_matrix": confusion_frame,
-        "top_confusions": top_confusions,
-        "test_errors": build_test_errors(
-            build_prediction_frame("test", test_frame, test_predictions, test_scores)
-        ),
-        "train_predictions": build_prediction_frame(
-            "train", train_frame, train_predictions, train_scores
-        ),
-        "test_predictions": build_prediction_frame("test", test_frame, test_predictions, test_scores),
-    }
-
-
-def build_test_errors(test_prediction_frame):
-    errors = test_prediction_frame[~test_prediction_frame["is_correct"]].copy()
-    if errors.empty:
-        return errors
-
-    if "predicted_score" in errors.columns:
-        errors = errors.sort_values(
-            by=["predicted_score", "true_label", "predicted_label"],
-            ascending=[False, True, True],
-        )
-    else:
-        errors = errors.sort_values(by=["true_label", "predicted_label"])
-
-    return errors
+    print(f"Model saved to {model_path}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="jobs.db")
-    parser.add_argument("--target", choices=sorted(TARGET_CONFIG), default="role")
-    parser.add_argument("--model-out", default=None)
-    parser.add_argument("--artifacts-dir", default=None)
-    parser.add_argument("--test-size", type=float, default=0.2)
-    parser.add_argument("--min-class-size", type=int, default=2)
-    parser.add_argument("--max-features", type=int, default=5000)
-    parser.add_argument("--exclude-other", action="store_true")
-    parser.add_argument("--class-weight", default="balanced")
+    parser.add_argument("--target", choices=["role", "seniority"], default="role")
     parser.add_argument("--allow-guess-fallback", action="store_true")
     args = parser.parse_args()
 
-    target_config = TARGET_CONFIG[args.target]
-    if not args.model_out:
-        args.model_out = target_config["default_model_out"]
-
-    dataframe = load_labeled_jobs(
+    dataframe, model_path = load_data(
         db_path=args.db,
-        min_class_size=args.min_class_size,
-        exclude_other=args.exclude_other,
-        label_column=target_config["label_column"],
-        guess_column=target_config["guess_column"],
+        target=args.target,
         allow_guess_fallback=args.allow_guess_fallback,
     )
 
     print(f"Training target: {args.target}")
     print(f"Rows used for training: {len(dataframe)}")
-    print(f"Using class_weight: {args.class_weight}")
-    print(f"Exclude Other: {args.exclude_other}")
     print("Class counts:")
     for label_name, count in dataframe["label"].value_counts().items():
         print(f"  {label_name}: {count}")
     print()
 
-    evaluation_result = train_and_evaluate(
-        dataframe=dataframe,
-        test_size=args.test_size,
-        max_features=args.max_features,
-        class_weight=args.class_weight,
-    )
-
-    print_summary(evaluation_result["summary_metrics"])
-    print_per_class_metrics(evaluation_result["per_class_metrics"])
-    print_confusion_matrix(evaluation_result["confusion_matrix"])
-    print_top_confusions(evaluation_result["top_confusions"])
-
-    artifact_paths = resolve_artifact_paths(args.model_out, args.artifacts_dir)
-    save_artifacts(evaluation_result, artifact_paths)
-
-    Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(evaluation_result["model"], args.model_out)
-    print(f"Model saved to {args.model_out}")
-    print("Saved artifacts:")
-    for artifact_name, artifact_path in artifact_paths.items():
-        print(f"  {artifact_name}: {artifact_path}")
+    train_and_save(dataframe, model_path)
 
 
 if __name__ == "__main__":

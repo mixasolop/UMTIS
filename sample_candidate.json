@@ -1,0 +1,17 @@
+{
+  "title": "Machine Learning Engineer Intern",
+  "summary": "Computer science student focused on NLP, information retrieval, ranking, and production-ready Python ML systems.",
+  "skills": [
+    "Python",
+    "SQL",
+    "scikit-learn",
+    "PyTorch",
+    "NLP",
+    "Machine Learning",
+    "FastAPI",
+    "Docker",
+    "Git",
+    "Statistics"
+  ],
+  "projects": "Built role and seniority classifiers, a multi-label skill tagger, and an explainable candidate-job matching pipeline."
+}
