@@ -2,7 +2,7 @@ true_label,Backend,Data Analyst,Data Scientist,DevOps,ML Engineer,Other,QA
 Backend,2,0,0,2,0,0,0
 Data Analyst,0,10,0,1,0,1,1
 Data Scientist,0,0,6,0,1,0,0
-DevOps,4,4,1,30,0,5,0
+DevOps,4,4,0,31,0,5,0
 ML Engineer,0,1,1,0,5,1,0
-Other,5,4,0,6,2,101,2
+Other,5,3,0,6,0,104,2
 QA,0,1,0,0,0,0,3

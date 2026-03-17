@@ -1,6 +1,6 @@
 import joblib
 
-from scraper import clean_text
+from scraper import build_model_text, clean_text, guess_role, guess_seniority
 
 
 model_job = joblib.load("job_classifier.pkl")
@@ -43,28 +43,56 @@ Applications will be considered on a rolling basis until the internship is fille
 If you're intrigued about this opportunity, but not sure you meet all the requirements, apply anyway.
 """
 
-text = f"{title} {clean_text(description)}"
-prediction = model_job.predict([text])[0]
+LOW_CONFIDENCE_THRESHOLD = 0.40
+
+
+def predict_with_fallback(model, text, heuristic_label):
+    prediction = model.predict([text])[0]
+    ranked = []
+
+    if hasattr(model, "predict_proba"):
+        probabilities = model.predict_proba([text])[0]
+        ranked = sorted(
+            zip(model.classes_, probabilities),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        top_label, top_score = ranked[0]
+        if heuristic_label and heuristic_label != "Other" and top_score < LOW_CONFIDENCE_THRESHOLD:
+            prediction = heuristic_label
+        else:
+            prediction = top_label
+
+    return prediction, ranked
+
+
+cleaned_description = clean_text(description)
+text = build_model_text(title, cleaned_description)
+prediction, ranked = predict_with_fallback(
+    model_job,
+    text,
+    guess_role(title, cleaned_description),
+)
 
 print("Prediction:", prediction)
 
-if hasattr(model_job, "predict_proba"):
-    probabilities = model_job.predict_proba([text])[0]
-    ranked = sorted(zip(model_job.classes_, probabilities), key=lambda item: item[1], reverse=True)
+if ranked:
     print("Top classes:")
     for label, score in ranked[:3]:
         print(f"  {label}: {score:.3f}")
 
 print("\nSeniority Prediction:")
 
-text = f"{title} {clean_text(description)}"
-prediction = model_sen.predict([text])[0]
+prediction, ranked = predict_with_fallback(
+    model_sen,
+    text,
+    guess_seniority(title, cleaned_description),
+)
 
 print("Prediction:", prediction)
 
-if hasattr(model_sen, "predict_proba"):
-    probabilities = model_sen.predict_proba([text])[0]
-    ranked = sorted(zip(model_sen.classes_, probabilities), key=lambda item: item[1], reverse=True)
+if ranked:
     print("Top classes:")
     for label, score in ranked[:3]:
         print(f"  {label}: {score:.3f}")

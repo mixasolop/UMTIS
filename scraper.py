@@ -92,6 +92,7 @@ ROLE_RULES = {
         r"\bbackend\b",
         r"\bback[- ]end\b",
         r"\bsoftware engineer\b",
+        r"\bsoftware engineering\b",
         r"\bsoftware developer\b",
         r"\bpython developer\b",
         r"\bjava developer\b",
@@ -459,6 +460,45 @@ def clean_text(text):
     text = trim_boilerplate_sections(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def normalize_title(title):
+    title = (title or "").strip()
+    title = re.sub(r"\s*\([^)]*\)\s*$", "", title)
+
+    title_parts = [part.strip() for part in title.split(",") if part.strip()]
+    if len(title_parts) <= 1:
+        return title
+
+    location_tokens = {
+        "remote",
+        "hybrid",
+        "onsite",
+        "warsaw",
+        "poland",
+        "london",
+        "uk",
+        "usa",
+        "india",
+        "emea",
+        "apac",
+        "europe",
+    }
+
+    kept_parts = [title_parts[0]]
+    for part in title_parts[1:]:
+        part_tokens = set(re.findall(r"[a-z]+", part.lower()))
+        if part_tokens and part_tokens <= location_tokens:
+            continue
+        kept_parts.append(part)
+
+    return ", ".join(kept_parts).strip()
+
+
+def build_model_text(title, description_clean, title_weight=3):
+    normalized_title = normalize_title(title)
+    weighted_title = " ".join([normalized_title] * max(title_weight, 1)).strip()
+    return f"{weighted_title} {description_clean or ''}".strip()
 
 
 def deduplicate_jobs(jobs):

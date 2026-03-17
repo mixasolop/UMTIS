@@ -12,6 +12,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 import warnings
 
+from scraper import build_model_text
+
 
 TOP_CONFUSION_LIMIT = 10
 TARGET_CONFIG = {
@@ -92,9 +94,13 @@ def load_labeled_jobs(
             "No labeled rows left after filtering. Try training without --exclude-other."
         )
 
-    dataframe["text"] = (
-        dataframe["title"].fillna("") + " " + dataframe["description_clean"].fillna("")
-    ).str.strip()
+    dataframe["text"] = [
+        build_model_text(title, description_clean)
+        for title, description_clean in zip(
+            dataframe["title"].fillna(""),
+            dataframe["description_clean"].fillna(""),
+        )
+    ]
 
     class_counts = dataframe["label"].value_counts()
     valid_labels = class_counts[class_counts >= min_class_size].index
