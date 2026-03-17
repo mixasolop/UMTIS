@@ -14,30 +14,78 @@ import warnings
 
 
 TOP_CONFUSION_LIMIT = 10
+TARGET_CONFIG = {
+    "role": {
+        "label_column": "role_label",
+        "guess_column": "role_guess",
+        "default_model_out": "job_classifier.pkl",
+    },
+    "seniority": {
+        "label_column": "seniority_label",
+        "guess_column": "seniority_guess",
+        "default_model_out": "job_seniority_classifier.pkl",
+    },
+}
 
 
-def load_labeled_jobs(db_path, min_class_size, exclude_other):
+def load_labeled_jobs(
+    db_path,
+    min_class_size,
+    exclude_other,
+    label_column,
+    guess_column,
+    allow_guess_fallback,
+):
     connection = sqlite3.connect(db_path)
     try:
         dataframe = pd.read_sql_query(
             """
-            SELECT job_id, company, source, title, description_clean, role_label
+            SELECT job_id, company, source, title, description_clean,
+                   {label_column} AS label,
+                   {guess_column} AS guess_label
             FROM jobs
-            WHERE role_label IS NOT NULL
-              AND TRIM(role_label) != ''
-            """,
+            """.format(label_column=label_column, guess_column=guess_column),
             connection,
         )
     finally:
         connection.close()
 
     if dataframe.empty:
+        raise ValueError("No rows found in jobs table.")
+
+    dataframe["label"] = dataframe["label"].fillna("").str.strip()
+    dataframe["guess_label"] = dataframe["guess_label"].fillna("").str.strip()
+
+    labeled_mask = dataframe["label"] != ""
+    if not labeled_mask.any():
+        if not allow_guess_fallback:
+            raise ValueError(
+                f"No labeled rows found in jobs.{label_column}. "
+                f"Import labels first or use --allow-guess-fallback to bootstrap from jobs.{guess_column}."
+            )
+
+        guessed_mask = dataframe["guess_label"] != ""
+        if not guessed_mask.any():
+            raise ValueError(
+                f"No labeled rows found in jobs.{label_column} and no fallback values are available in jobs.{guess_column}."
+            )
+
+        print(
+            f"Warning: no manual labels found in {label_column}. "
+            f"Falling back to {guess_column} for training."
+        )
+        dataframe = dataframe[guessed_mask].copy()
+        dataframe["label"] = dataframe["guess_label"]
+    else:
+        dataframe = dataframe[labeled_mask].copy()
+
+    if dataframe.empty:
         raise ValueError(
-            "No labeled rows found in jobs table. Fill role_label and import labels first."
+            "No labeled rows available after filtering."
         )
 
     if exclude_other:
-        dataframe = dataframe[dataframe["role_label"] != "Other"].copy()
+        dataframe = dataframe[dataframe["label"] != "Other"].copy()
 
     if dataframe.empty:
         raise ValueError(
@@ -48,9 +96,9 @@ def load_labeled_jobs(db_path, min_class_size, exclude_other):
         dataframe["title"].fillna("") + " " + dataframe["description_clean"].fillna("")
     ).str.strip()
 
-    class_counts = dataframe["role_label"].value_counts()
+    class_counts = dataframe["label"].value_counts()
     valid_labels = class_counts[class_counts >= min_class_size].index
-    filtered_dataframe = dataframe[dataframe["role_label"].isin(valid_labels)].copy()
+    filtered_dataframe = dataframe[dataframe["label"].isin(valid_labels)].copy()
 
     dropped_labels = class_counts[class_counts < min_class_size]
     if not dropped_labels.empty:
@@ -59,7 +107,7 @@ def load_labeled_jobs(db_path, min_class_size, exclude_other):
             print(f"  {label_name}: {count}")
         print()
 
-    if filtered_dataframe["role_label"].nunique() < 2:
+    if filtered_dataframe["label"].nunique() < 2:
         raise ValueError(
             "Need at least 2 classes with enough labeled rows to train a classifier."
         )
@@ -99,10 +147,10 @@ def get_prediction_scores(model, features):
 
 def build_prediction_frame(split_name, dataframe, predicted_labels, predicted_scores):
     prediction_frame = dataframe[
-        ["job_id", "company", "source", "title", "description_clean", "role_label"]
+        ["job_id", "company", "source", "title", "description_clean", "label"]
     ].copy()
     prediction_frame.insert(0, "split", split_name)
-    prediction_frame = prediction_frame.rename(columns={"role_label": "true_label"})
+    prediction_frame = prediction_frame.rename(columns={"label": "true_label"})
     prediction_frame["predicted_label"] = predicted_labels
     prediction_frame["is_correct"] = (
         prediction_frame["true_label"] == prediction_frame["predicted_label"]
@@ -227,6 +275,7 @@ def resolve_artifact_paths(model_out, artifacts_dir):
         "per_class_metrics": output_dir / f"{stem}_per_class_metrics.csv",
         "confusion_matrix": output_dir / f"{stem}_confusion_matrix.csv",
         "top_confusions": output_dir / f"{stem}_top_confusion_pairs.csv",
+        "test_errors": output_dir / f"{stem}_test_errors.csv",
         "summary_metrics": output_dir / f"{stem}_summary_metrics.csv",
     }
 
@@ -243,6 +292,7 @@ def save_artifacts(evaluation_result, artifact_paths):
     evaluation_result["top_confusions"].to_csv(
         artifact_paths["top_confusions"], index=False
     )
+    evaluation_result["test_errors"].to_csv(artifact_paths["test_errors"], index=False)
     pd.DataFrame([evaluation_result["summary_metrics"]]).to_csv(
         artifact_paths["summary_metrics"], index=False
     )
@@ -253,13 +303,13 @@ def train_and_evaluate(dataframe, test_size, max_features, class_weight):
         dataframe,
         test_size=test_size,
         random_state=42,
-        stratify=dataframe["role_label"],
+        stratify=dataframe["label"],
     )
 
     x_train = train_frame["text"]
-    y_train = train_frame["role_label"]
+    y_train = train_frame["label"]
     x_test = test_frame["text"]
-    y_test = test_frame["role_label"]
+    y_test = test_frame["label"]
 
     model = build_model(max_features=max_features, class_weight=class_weight)
     with warnings.catch_warnings():
@@ -298,38 +348,65 @@ def train_and_evaluate(dataframe, test_size, max_features, class_weight):
         "per_class_metrics": per_class_metrics,
         "confusion_matrix": confusion_frame,
         "top_confusions": top_confusions,
+        "test_errors": build_test_errors(
+            build_prediction_frame("test", test_frame, test_predictions, test_scores)
+        ),
         "train_predictions": build_prediction_frame(
             "train", train_frame, train_predictions, train_scores
         ),
-        "test_predictions": build_prediction_frame(
-            "test", test_frame, test_predictions, test_scores
-        ),
+        "test_predictions": build_prediction_frame("test", test_frame, test_predictions, test_scores),
     }
+
+
+def build_test_errors(test_prediction_frame):
+    errors = test_prediction_frame[~test_prediction_frame["is_correct"]].copy()
+    if errors.empty:
+        return errors
+
+    if "predicted_score" in errors.columns:
+        errors = errors.sort_values(
+            by=["predicted_score", "true_label", "predicted_label"],
+            ascending=[False, True, True],
+        )
+    else:
+        errors = errors.sort_values(by=["true_label", "predicted_label"])
+
+    return errors
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="jobs.db")
-    parser.add_argument("--model-out", default="job_classifier.pkl")
+    parser.add_argument("--target", choices=sorted(TARGET_CONFIG), default="role")
+    parser.add_argument("--model-out", default=None)
     parser.add_argument("--artifacts-dir", default=None)
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--min-class-size", type=int, default=2)
     parser.add_argument("--max-features", type=int, default=5000)
     parser.add_argument("--exclude-other", action="store_true")
     parser.add_argument("--class-weight", default="balanced")
+    parser.add_argument("--allow-guess-fallback", action="store_true")
     args = parser.parse_args()
+
+    target_config = TARGET_CONFIG[args.target]
+    if not args.model_out:
+        args.model_out = target_config["default_model_out"]
 
     dataframe = load_labeled_jobs(
         db_path=args.db,
         min_class_size=args.min_class_size,
         exclude_other=args.exclude_other,
+        label_column=target_config["label_column"],
+        guess_column=target_config["guess_column"],
+        allow_guess_fallback=args.allow_guess_fallback,
     )
 
+    print(f"Training target: {args.target}")
     print(f"Rows used for training: {len(dataframe)}")
     print(f"Using class_weight: {args.class_weight}")
     print(f"Exclude Other: {args.exclude_other}")
     print("Class counts:")
-    for label_name, count in dataframe["role_label"].value_counts().items():
+    for label_name, count in dataframe["label"].value_counts().items():
         print(f"  {label_name}: {count}")
     print()
 

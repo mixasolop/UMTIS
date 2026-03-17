@@ -3,7 +3,8 @@ import joblib
 from scraper import clean_text
 
 
-model = joblib.load("job_classifier.pkl")
+model_job = joblib.load("job_classifier.pkl")
+model_sen = joblib.load("job_seniority_classifier.pkl")
 
 title = "Software Engineering Intern, Warsaw, Poland (Summer 2026)"
 description = """
@@ -43,13 +44,27 @@ If you're intrigued about this opportunity, but not sure you meet all the requir
 """
 
 text = f"{title} {clean_text(description)}"
-prediction = model.predict([text])[0]
+prediction = model_job.predict([text])[0]
 
 print("Prediction:", prediction)
 
-if hasattr(model, "predict_proba"):
-    probabilities = model.predict_proba([text])[0]
-    ranked = sorted(zip(model.classes_, probabilities), key=lambda item: item[1], reverse=True)
+if hasattr(model_job, "predict_proba"):
+    probabilities = model_job.predict_proba([text])[0]
+    ranked = sorted(zip(model_job.classes_, probabilities), key=lambda item: item[1], reverse=True)
+    print("Top classes:")
+    for label, score in ranked[:3]:
+        print(f"  {label}: {score:.3f}")
+
+print("\nSeniority Prediction:")
+
+text = f"{title} {clean_text(description)}"
+prediction = model_sen.predict([text])[0]
+
+print("Prediction:", prediction)
+
+if hasattr(model_sen, "predict_proba"):
+    probabilities = model_sen.predict_proba([text])[0]
+    ranked = sorted(zip(model_sen.classes_, probabilities), key=lambda item: item[1], reverse=True)
     print("Top classes:")
     for label, score in ranked[:3]:
         print(f"  {label}: {score:.3f}")

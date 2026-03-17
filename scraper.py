@@ -28,6 +28,16 @@ ROLE_CLASSES = [
     "Other",
 ]
 
+SENIORITY_CLASSES = [
+    "Intern",
+    "Junior",
+    "Mid",
+    "Senior",
+    "Lead/Staff",
+    "Manager/Director",
+    "Other",
+]
+
 ROLE_RULES = {
     "ML Engineer": [
         r"\bml engineer\b",
@@ -92,6 +102,40 @@ ROLE_RULES = {
     ],
 }
 
+SENIORITY_RULES = {
+    "Intern": [
+        r"\bintern\b",
+        r"\binternship\b",
+        r"\bworking student\b",
+        r"\bco-op\b",
+    ],
+    "Junior": [
+        r"\bjunior\b",
+        r"\bjr\b",
+        r"\bgraduate\b",
+        r"\bnew grad\b",
+        r"\bentry level\b",
+        r"\bassociate\b",
+    ],
+    "Senior": [
+        r"\bsenior\b",
+        r"\bsr\b",
+    ],
+    "Lead/Staff": [
+        r"\blead\b",
+        r"\bstaff\b",
+        r"\bprincipal\b",
+        r"\barchitect\b",
+    ],
+    "Manager/Director": [
+        r"\bmanager\b",
+        r"\bdirector\b",
+        r"\bhead\b",
+        r"\bvice president\b",
+        r"\bvp\b",
+    ],
+}
+
 SKILL_PATTERNS = {
     "Python": [r"\bpython\b"],
     "SQL": [r"\bsql\b"],
@@ -141,6 +185,19 @@ SKILL_PATTERNS = {
     "Kafka": [r"\bkafka\b", r"\bapache kafka\b"],
 }
 
+BOILERPLATE_MARKERS = [
+    "Pay Transparency Notice",
+    "Global Data Privacy Notice",
+    "Commitment to Equal Opportunity",
+    "Equal Employment Opportunity",
+    "Equal Opportunity Employer",
+    "To request a reasonable accommodation",
+    "We are committed to ensuring that all candidates have an equal opportunity",
+    "The target annual base salary for this position can range",
+    "MongoDB's base salary range",
+    "MongoDB’s base salary range",
+]
+
 
 def create_tables(connection):
     connection.execute(
@@ -162,6 +219,8 @@ def create_tables(connection):
     ensure_column(connection, "jobs", "description_clean", "TEXT")
     ensure_column(connection, "jobs", "role_guess", "TEXT")
     ensure_column(connection, "jobs", "role_label", "TEXT")
+    ensure_column(connection, "jobs", "seniority_guess", "TEXT")
+    ensure_column(connection, "jobs", "seniority_label", "TEXT")
 
     connection.execute(
         """
@@ -206,21 +265,24 @@ def backfill_existing_jobs(connection):
         FROM jobs
         WHERE description_clean IS NULL
            OR role_guess IS NULL
+           OR seniority_guess IS NULL
            OR TRIM(COALESCE(description_clean, '')) = ''
            OR TRIM(COALESCE(role_guess, '')) = ''
+           OR TRIM(COALESCE(seniority_guess, '')) = ''
         """
     ).fetchall()
 
     for job_id, title, description in rows:
         description_clean = clean_text(description or "")
         role_guess = guess_role(title or "", description_clean)
+        seniority_guess = guess_seniority(title or "", description_clean)
         connection.execute(
             """
             UPDATE jobs
-            SET description_clean = ?, role_guess = ?
+            SET description_clean = ?, role_guess = ?, seniority_guess = ?
             WHERE job_id = ?
             """,
-            (description_clean, role_guess, job_id),
+            (description_clean, role_guess, seniority_guess, job_id),
         )
 
     connection.commit()
@@ -272,6 +334,7 @@ def fetch_remoteok_jobs():
         raw_description = item.get("description") or ""
         description_clean = clean_text(raw_description)
         role_guess = guess_role(title, description_clean)
+        seniority_guess = guess_seniority(title, description_clean)
 
         if role_guess == "Other":
             continue
@@ -288,6 +351,7 @@ def fetch_remoteok_jobs():
                 "source": "remoteok",
                 "job_url": item.get("url") or item.get("apply_url") or "",
                 "role_guess": role_guess,
+                "seniority_guess": seniority_guess,
             }
         )
 
@@ -303,6 +367,7 @@ def fetch_greenhouse_jobs(board):
         raw_description = item.get("content") or ""
         description_clean = clean_text(raw_description)
         role_guess = guess_role(title, description_clean)
+        seniority_guess = guess_seniority(title, description_clean)
 
         if role_guess == "Other":
             continue
@@ -323,6 +388,7 @@ def fetch_greenhouse_jobs(board):
                 "source": "greenhouse",
                 "job_url": item.get("absolute_url") or "",
                 "role_guess": role_guess,
+                "seniority_guess": seniority_guess,
             }
         )
 
@@ -346,9 +412,51 @@ def guess_role(title, description_clean):
     return best_role
 
 
+def guess_seniority(title, description_clean):
+    title_text = (title or "").lower()
+    description_text = (description_clean or "").lower()
+
+    for seniority_name in [
+        "Manager/Director",
+        "Lead/Staff",
+        "Senior",
+        "Junior",
+        "Intern",
+    ]:
+        for pattern in SENIORITY_RULES[seniority_name]:
+            if re.search(pattern, title_text):
+                return seniority_name
+
+    for seniority_name in ["Intern", "Junior"]:
+        for pattern in SENIORITY_RULES[seniority_name]:
+            if re.search(pattern, description_text):
+                return seniority_name
+
+    return "Mid"
+
+
+def trim_boilerplate_sections(text):
+    earliest_index = None
+    lowercase_text = text.lower()
+
+    for marker in BOILERPLATE_MARKERS:
+        marker_index = lowercase_text.find(marker.lower())
+        if marker_index == -1 or marker_index < 500:
+            continue
+        if earliest_index is None or marker_index < earliest_index:
+            earliest_index = marker_index
+
+    if earliest_index is not None:
+        return text[:earliest_index]
+
+    return text
+
+
 def clean_text(text):
-    text = html.unescape(text)
+    text = html.unescape(text or "")
+    text = text.replace("\xa0", " ")
     text = re.sub(r"<[^>]+>", " ", text)
+    text = trim_boilerplate_sections(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -375,8 +483,8 @@ def save_jobs(connection, jobs):
             """
             INSERT INTO jobs (
                 job_id, title, company, location, description, description_clean,
-                date, source, job_url, role_guess
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                date, source, job_url, role_guess, seniority_guess
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 title = excluded.title,
                 company = excluded.company,
@@ -386,7 +494,8 @@ def save_jobs(connection, jobs):
                 date = excluded.date,
                 source = excluded.source,
                 job_url = excluded.job_url,
-                role_guess = excluded.role_guess
+                role_guess = excluded.role_guess,
+                seniority_guess = excluded.seniority_guess
             """,
             (
                 job["job_id"],
@@ -399,6 +508,7 @@ def save_jobs(connection, jobs):
                 job["source"],
                 job["job_url"],
                 job["role_guess"],
+                job["seniority_guess"],
             ),
         )
 
@@ -428,7 +538,8 @@ def export_labels(connection, csv_path, limit, include_labeled):
     if include_labeled:
         rows = connection.execute(
             """
-            SELECT job_id, title, company, location, date, source, role_guess, role_label, description_clean
+            SELECT job_id, title, company, location, date, source, role_guess, role_label,
+                   seniority_guess, seniority_label, description_clean
             FROM jobs
             ORDER BY id DESC
             LIMIT ?
@@ -438,9 +549,11 @@ def export_labels(connection, csv_path, limit, include_labeled):
     else:
         rows = connection.execute(
             """
-            SELECT job_id, title, company, location, date, source, role_guess, role_label, description_clean
+            SELECT job_id, title, company, location, date, source, role_guess, role_label,
+                   seniority_guess, seniority_label, description_clean
             FROM jobs
             WHERE role_label IS NULL OR TRIM(role_label) = ''
+               OR seniority_label IS NULL OR TRIM(seniority_label) = ''
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -459,6 +572,8 @@ def export_labels(connection, csv_path, limit, include_labeled):
                 "source",
                 "role_guess",
                 "role_label",
+                "seniority_guess",
+                "seniority_label",
                 "description_clean",
             ]
         )
@@ -474,12 +589,25 @@ def import_labels(connection, csv_path):
         reader = csv.DictReader(file_handle)
         for row in reader:
             role_label = (row.get("role_label") or "").strip()
-            if role_label not in ROLE_CLASSES:
+            seniority_label = (row.get("seniority_label") or "").strip()
+
+            if not role_label and not seniority_label:
+                continue
+
+            if role_label and role_label not in ROLE_CLASSES:
+                continue
+
+            if seniority_label and seniority_label not in SENIORITY_CLASSES:
                 continue
 
             connection.execute(
-                "UPDATE jobs SET role_label = ? WHERE job_id = ?",
-                (role_label, row["job_id"]),
+                """
+                UPDATE jobs
+                SET role_label = COALESCE(NULLIF(?, ''), role_label),
+                    seniority_label = COALESCE(NULLIF(?, ''), seniority_label)
+                WHERE job_id = ?
+                """,
+                (role_label, seniority_label, row["job_id"]),
             )
             updated += 1
 
@@ -558,6 +686,21 @@ def show_stats(connection):
         """
     ).fetchall():
         print(f"  {role_name}: {count}")
+
+    seniority_rows = connection.execute(
+        """
+        SELECT seniority_guess, COUNT(*)
+        FROM jobs
+        WHERE seniority_guess IS NOT NULL AND TRIM(seniority_guess) != ''
+        GROUP BY seniority_guess
+        ORDER BY COUNT(*) DESC
+        """
+    ).fetchall()
+    if seniority_rows:
+        print()
+        print("Jobs by seniority guess:")
+        for seniority_name, count in seniority_rows:
+            print(f"  {seniority_name}: {count}")
 
     print()
     print("Top skills:")
@@ -658,8 +801,10 @@ def main():
             )
             print(f"Exported rows: {exported}")
             print(f"CSV file: {args.csv}")
-            print("Allowed labels:")
+            print("Allowed role labels:")
             print(", ".join(ROLE_CLASSES))
+            print("Allowed seniority labels:")
+            print(", ".join(SENIORITY_CLASSES))
         elif args.command == "import-labels":
             updated = import_labels(connection, csv_path=args.csv)
             print(f"Imported labels: {updated}")

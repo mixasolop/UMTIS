@@ -1,0 +1,11 @@
+true_label,predicted_label,count
+Mid,Senior,7
+Mid,Manager/Director,6
+Lead/Staff,Manager/Director,5
+Mid,Junior,4
+Lead/Staff,Senior,3
+Senior,Lead/Staff,3
+Lead/Staff,Mid,2
+Manager/Director,Intern,2
+Manager/Director,Junior,2
+Manager/Director,Mid,2
